@@ -2,7 +2,13 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Client } from '@microsoft/microsoft-graph-client';
-import { DeviceCodeCredential } from '@azure/identity';
+import {
+  DeviceCodeCredential,
+  useIdentityPlugin,
+  serializeAuthenticationRecord,
+  deserializeAuthenticationRecord
+} from '@azure/identity';
+import { cachePersistencePlugin } from '@azure/identity-cache-persistence';
 import { JSDOM } from 'jsdom';
 import fs from 'fs';
 import path from 'path';
@@ -14,11 +20,16 @@ import { z } from "zod";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const tokenFilePath = path.join(__dirname, '.access-token.txt');
+const authRecordFilePath = path.join(__dirname, '.auth-record.json');
 const notebookCacheFilePath = path.join(__dirname, '.notebook-cache.json');
 const clientId = process.env.AZURE_CLIENT_ID || '14d82eec-204b-4c2f-b7e8-296a70dab67e'; // Default: Microsoft Graph Explorer App ID
 // Updated scopes to include .All permissions for accessing shared/team notebooks
 const scopes = ['Notes.Read', 'Notes.ReadWrite', 'Notes.Read.All', 'Notes.ReadWrite.All', 'Notes.Create', 'User.Read'];
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Register the persistent token cache plugin (backed by macOS Keychain) once,
+// before any credential is constructed, so refresh tokens survive process restarts.
+useIdentityPlugin(cachePersistencePlugin);
 
 // --- Global State ---
 let accessToken = null;
@@ -28,6 +39,8 @@ let cacheTimestamp = null; // When cache was last updated
 let teamNotebooksLoading = false; // Flag to prevent duplicate team loads
 let sectionToNotebookMap = {}; // Maps sectionId → notebookId for page→endpoint resolution
 let resolvedSiteIds = {}; // Cache of siteUrl → siteId to avoid re-resolving
+let sharedCredential = null; // Single DeviceCodeCredential instance, reused across calls
+let latestDeviceCodeInfo = null; // Set by userPromptCallback when interactive auth is needed
 
 // --- MCP Server Initialization ---
 const server = new McpServer({
@@ -78,14 +91,119 @@ function initializeGraphClient() {
 }
 
 /**
+ * Loads a previously-saved MSAL AuthenticationRecord from disk, if present.
+ * This tells the credential which cached account to look up in the
+ * persisted (Keychain-backed) token cache on process restart.
+ * @returns {object | undefined}
+ */
+function loadAuthenticationRecord() {
+  try {
+    if (fs.existsSync(authRecordFilePath)) {
+      const raw = fs.readFileSync(authRecordFilePath, 'utf8');
+      return deserializeAuthenticationRecord(raw);
+    }
+  } catch (error) {
+    console.error(`Error loading authentication record: ${error.message}`);
+  }
+  return undefined;
+}
+
+/**
+ * Persists the MSAL AuthenticationRecord to disk after a successful interactive auth.
+ * @param {object} record - The AuthenticationRecord returned by credential.authenticate().
+ */
+function saveAuthenticationRecord(record) {
+  try {
+    fs.writeFileSync(authRecordFilePath, serializeAuthenticationRecord(record));
+    console.error('Authentication record saved — future restarts can renew silently.');
+  } catch (error) {
+    console.error(`Error saving authentication record: ${error.message}`);
+  }
+}
+
+/**
+ * Writes the current in-memory access token to the flat token file
+ * (kept for backward compatibility with checkTokenScopes and older tooling).
+ * @param {object} tokenResponse - The token response from credential.getToken().
+ */
+function persistAccessTokenFile(tokenResponse) {
+  try {
+    const tokenData = {
+      token: accessToken,
+      clientId,
+      scopes,
+      createdAt: new Date().toISOString(),
+      expiresOn: tokenResponse?.expiresOnTimestamp ? new Date(tokenResponse.expiresOnTimestamp).toISOString() : null
+    };
+    fs.writeFileSync(tokenFilePath, JSON.stringify(tokenData, null, 2));
+  } catch (error) {
+    console.error(`Error persisting access token file: ${error.message}`);
+  }
+}
+
+/**
+ * Gets (or lazily creates) the single shared DeviceCodeCredential instance.
+ * Cache persistence is enabled so refresh tokens survive process restarts
+ * (stored in the macOS Keychain). disableAutomaticAuthentication is set so
+ * that silent getToken() calls fail fast instead of unexpectedly prompting
+ * mid-tool-call — interactive prompting only happens via the explicit
+ * 'authenticate' tool, which calls credential.authenticate() directly.
+ * @returns {DeviceCodeCredential}
+ */
+function getSharedCredential() {
+  if (!sharedCredential) {
+    const existingRecord = loadAuthenticationRecord();
+    sharedCredential = new DeviceCodeCredential({
+      clientId,
+      tokenCachePersistenceOptions: {
+        enabled: true,
+        name: 'onenote-mcp-token-cache'
+      },
+      disableAutomaticAuthentication: true,
+      authenticationRecord: existingRecord,
+      userPromptCallback: (info) => {
+        latestDeviceCodeInfo = info;
+        console.error(`\n=== AUTHENTICATION REQUIRED ===\n${info.message}\n================================\n`);
+      }
+    });
+  }
+  return sharedCredential;
+}
+
+/**
+ * Attempts to silently acquire an access token from the persisted cache
+ * (no browser prompt). Returns true on success, false otherwise.
+ * @returns {Promise<boolean>}
+ */
+async function trySilentToken() {
+  try {
+    const credential = getSharedCredential();
+    const tokenResponse = await credential.getToken(scopes);
+    if (tokenResponse?.token) {
+      accessToken = tokenResponse.token;
+      persistAccessTokenFile(tokenResponse);
+      console.error('Renewed access token silently from persisted cache.');
+      return true;
+    }
+  } catch (error) {
+    console.error(`Silent token acquisition unavailable (will need interactive auth): ${error.message}`);
+  }
+  return false;
+}
+
+/**
  * Ensures the Graph client is initialized and authenticated.
- * Loads token if not present, then initializes client.
+ * Tries silent renewal from the persisted cache first, then falls back to
+ * the flat token file (backward compatibility), before giving up.
  * @throws {Error} If no access token is available after attempting to load.
  * @returns {Promise<Client>} The initialized and authenticated Graph client.
  */
 async function ensureGraphClient() {
   if (!accessToken) {
-    loadExistingToken();
+    const gotSilentToken = await trySilentToken();
+    if (!gotSilentToken) {
+      loadExistingToken();
+    }
   }
   if (!accessToken) {
     throw new Error('No access token available. Please authenticate first using the "authenticate" tool.');
@@ -817,45 +935,39 @@ server.tool(
   async () => {
     try {
       console.error('Starting device code authentication...');
-      let deviceCodeInfo = null;
-      const credential = new DeviceCodeCredential({
-        clientId: clientId,
-        userPromptCallback: (info) => {
-          deviceCodeInfo = info;
-          console.error(`\n=== AUTHENTICATION REQUIRED ===\n${info.message}\n================================\n`);
-        }
-      });
+      latestDeviceCodeInfo = null;
+      const credential = getSharedCredential();
 
-      const authPromise = credential.getToken(scopes);
+      // credential.authenticate() forces the interactive device-code flow
+      // (bypassing disableAutomaticAuthentication) and, on success, returns
+      // an AuthenticationRecord we persist so future processes can renew
+      // silently from the Keychain-backed cache without prompting again.
+      const authPromise = credential.authenticate(scopes)
+        .then(async (authRecord) => {
+          saveAuthenticationRecord(authRecord);
+          const tokenResponse = await credential.getToken(scopes);
+          accessToken = tokenResponse.token;
+          persistAccessTokenFile(tokenResponse);
+          console.error('Token acquired and cached — future sessions should renew automatically.');
+          initializeGraphClient();
+        })
+        .catch(error => {
+          console.error(`Background authentication failed: ${error.message}`);
+        });
+
       await new Promise(resolve => setTimeout(resolve, 2000)); // Allow time for userPromptCallback
 
-      if (deviceCodeInfo) {
+      if (latestDeviceCodeInfo) {
         const authMessage = `🔐 **AUTHENTICATION REQUIRED**
 
 Please complete the following steps:
 1. **Open this URL in your browser:** https://microsoft.com/devicelogin
-2. **Enter this code:** ${deviceCodeInfo.userCode}
+2. **Enter this code:** ${latestDeviceCodeInfo.userCode}
 3. **Sign in with your Microsoft account that has OneNote access.**
-4. **After completing authentication, use the 'saveAccessToken' tool.**
+4. **After completing authentication, use the 'saveAccessToken' tool to verify.**
 
-Token will be saved automatically upon successful browser authentication.`;
+This will be saved to your Mac Keychain — future sessions should renew automatically without repeating this step.`;
 
-        authPromise.then(tokenResponse => {
-          accessToken = tokenResponse.token;
-          const tokenData = {
-            token: accessToken,
-            clientId: clientId,
-            scopes: scopes,
-            createdAt: new Date().toISOString(),
-            expiresOn: tokenResponse.expiresOnTimestamp ? new Date(tokenResponse.expiresOnTimestamp).toISOString() : null
-          };
-          fs.writeFileSync(tokenFilePath, JSON.stringify(tokenData, null, 2));
-          console.error('Token saved successfully!');
-          initializeGraphClient();
-        }).catch(error => {
-          console.error(`Background authentication failed: ${error.message}`);
-        });
-        
         return { content: [{ type: 'text', text: authMessage }] };
       } else {
         return { isError: true, content: [{ type: 'text', text: 'Could not retrieve device code information. Please try again or check console logs.' }] };
@@ -877,7 +989,12 @@ server.tool(
   },
   async () => {
     try {
-      loadExistingToken();
+      if (!accessToken) {
+        await trySilentToken();
+      }
+      if (!accessToken) {
+        loadExistingToken();
+      }
       if (accessToken) {
         initializeGraphClient();
         const testResponse = await graphClient.api('/me').get();
